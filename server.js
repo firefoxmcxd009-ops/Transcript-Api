@@ -2,49 +2,40 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import ffmpeg from 'fluent-ffmpeg';
-import { pipeline, env } from '@xenova/transformers';
 import fs from 'fs';
 import path from 'path';
 
-env.cacheDir = './.cache';
-
 const app = express();
+
+// អនុញ្ញាតឲ្យ Frontend មកពីគ្រប់ទិសទីអាចហៅទៅកាន់ API នេះបាន
 app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static('uploads'));
 
+// បង្កើត Folder សម្រាប់ទុកហ្វាយបណ្ដោះអាសន្ន បើមិនទាន់មាន
 if (!fs.existsSync('uploads')) {
     fs.mkdirSync('uploads');
 }
 
 const upload = multer({ dest: 'uploads/' });
 
-let transcriber;
-async function getTranscriber() {
-    if (!transcriber) {
-        console.log("Loading AI Model...");
-        // បន្ថែម quantized: true ដើម្បីឲ្យ Model រត់ក្នុងទំហំតូចបំផុត សន្សំសំចៃ RAM
-        transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny', { quantized: true });
-        console.log("Model Loaded!");
-    }
-    return transcriber;
-}
-getTranscriber(); 
+// 🔒 ទាញយក Token ពីប្រព័ន្ធសុវត្ថិភាពរបស់ Render (កុំសរសេរកូដសម្ងាត់ចូលទីនេះផ្ទាល់)
+const HF_TOKEN = process.env.HF_TOKEN; 
 
-// មុខងារជំនួយ៖ បម្លែង WAV ទៅជាទិន្នន័យលេខរាយ (Raw PCM Float32)
-const convertWavToPcm = (wavPath, pcmPath) => {
-    return new Promise((resolve, reject) => {
-        ffmpeg(wavPath)
-            .toFormat('f32le') 
-            .audioFrequency(16000)
-            .audioChannels(1)
-            .on('end', () => resolve())
-            .on('error', (err) => reject(err))
-            .save(pcmPath);
+// ==========================================
+// 🔄 [GET] សម្រាប់ឆែកមើលស្ថានភាព Server (Health Check)
+// ==========================================
+app.get('/api/status', (req, res) => {
+    res.json({ 
+        status: "online", 
+        message: "Server ដើររលូនល្អណាស់ bro!",
+        timestamp: new Date() 
     });
-};
+});
 
-// 1. API សម្រាប់ Upload 
+// ==========================================
+// 🔄 [POST] សម្រាប់ទទួល Upload និងច្នៃហ្វាយសំឡេង
+// ==========================================
 app.post('/api/process-file', upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: "មិនមានឯកសារឡើយ" });
 
@@ -57,11 +48,10 @@ app.post('/api/process-file', upload.single('file'), (req, res) => {
         .audioFrequency(16000)
         .audioChannels(1)
         .on('end', () => {
-            fs.unlinkSync(inputPath); 
+            fs.unlinkSync(inputPath); // លុបហ្វាយដើមចោល សន្សំទំហំម៉ាស៊ីន
             res.json({ 
-                message: "ជោគជ័យ", 
-                audioName: audioName,
-                audioUrl: `/uploads/${audioName}` 
+                message: "ច្នៃហ្វាយជោគជ័យ", 
+                audioName: audioName 
             });
         })
         .on('error', (err) => {
@@ -71,46 +61,56 @@ app.post('/api/process-file', upload.single('file'), (req, res) => {
         .save(audioPath);
 });
 
-// 2. API សម្រាប់ Transcript (ទម្រង់សន្សំសំចៃ RAM ខ្ពស់)
+// ==========================================
+// 🔄 [POST + HEADERS] សម្រាប់ផ្ញើទៅ AI Hugging Face
+// ==========================================
 app.post('/api/transcript', async (req, res) => {
-    const { audioName, language } = req.body;
+    const { audioName } = req.body;
     if (!audioName) return res.status(400).json({ error: "មិនមានឈ្មោះ File Audio" });
 
     const audioPath = path.join('uploads', audioName);
-    const pcmPath = audioPath + '.pcm';
 
     if (!fs.existsSync(audioPath)) {
-        return res.status(404).json({ error: "រកមិនឃើញឯកសារសំឡេង" });
+        return res.status(404).json({ error: "រកមិនឃើញឯកសារសំឡេងនៅលើ Server ឡើយ" });
     }
 
     try {
-        await convertWavToPcm(audioPath, pcmPath);
+        const audioBuffer = fs.readFileSync(audioPath);
 
-        // វិធីសាស្ត្រថ្មី៖ អានទិន្នន័យផ្ទាល់ពី Memory Buffer ដោយមិនបង្កើតទិន្នន័យស្ទួន (Zero-Copy)
-        const buffer = fs.readFileSync(pcmPath);
-        const audioData = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.length / 4);
+        console.log("កំពុងផ្ញើសំណើទៅកាន់ Hugging Face AI...");
+        
+        // 🚀 ហៅទៅកាន់ Hugging Face API ដោយប្រើប្រាស់ METHOD: POST និង HEADERS
+        const hfResponse = await fetch(
+            "https://api-inference.huggingface.co/models/openai/whisper-large-v3",
+            {
+                method: "POST", // ប្រើប្រាស់ POST Method
+                headers: { 
+                    "Authorization": `Bearer ${HF_TOKEN}`, // ដាក់ Token ក្នុង Headers
+                    "Content-Type": "audio/wav"
+                },
+                body: audioBuffer,
+            }
+        );
 
-        const model = await getTranscriber();
-        const options = { task: 'transcribe' };
-        if (language && language !== 'auto') {
-            options.language = language;
+        const result = await hfResponse.json();
+
+        // ប្រើរួច លុបហ្វាយសំឡេងចេញភ្លាម កុំឲ្យណែនម៉ាស៊ីន Free Tier
+        if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+
+        if (result.error) {
+            return res.status(500).json({ error: "AI Error: " + result.error });
         }
 
-        const result = await model(audioData, options);
-
-        // សម្អាតទិន្នន័យក្នុង RAM ភ្លាមៗក្រោយប្រើរួច
-        if (fs.existsSync(pcmPath)) fs.unlinkSync(pcmPath);
-
-        res.json({ text: result.text });
+        res.json({ text: result.text || "AI ស្ដាប់ហើយ តែមិនឮនិយាយអ្វីសោះ bro!" });
 
     } catch (error) {
-        if (fs.existsSync(pcmPath)) fs.unlinkSync(pcmPath);
+        if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
         console.error(error);
-        res.status(500).json({ error: "AI មានបញ្ហាក្នុងការស្ដាប់៖ " + error.message });
+        res.status(500).json({ error: "ការភ្ជាប់ទៅកាន់ AI មានបញ្ហា៖ " + error.message });
     }
 });
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-    console.log(`Backend running on port ${PORT}`);
+    console.log(`Backend កំពុងរត់លើ Port ${PORT}`);
 });
