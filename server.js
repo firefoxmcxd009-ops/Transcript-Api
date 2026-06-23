@@ -23,18 +23,19 @@ let transcriber;
 async function getTranscriber() {
     if (!transcriber) {
         console.log("Loading AI Model...");
-        transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny');
+        // បន្ថែម quantized: true ដើម្បីឲ្យ Model រត់ក្នុងទំហំតូចបំផុត សន្សំសំចៃ RAM
+        transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny', { quantized: true });
         console.log("Model Loaded!");
     }
     return transcriber;
 }
 getTranscriber(); 
 
-// មុខងារជំនួយ៖ បម្លែង WAV ទៅជាទិន្នន័យលេខរាយ (Raw PCM Float32) សម្រាប់ AI
+// មុខងារជំនួយ៖ បម្លែង WAV ទៅជាទិន្នន័យលេខរាយ (Raw PCM Float32)
 const convertWavToPcm = (wavPath, pcmPath) => {
     return new Promise((resolve, reject) => {
         ffmpeg(wavPath)
-            .toFormat('f32le') // បម្លែងទៅជា 32-bit floating point PCM
+            .toFormat('f32le') 
             .audioFrequency(16000)
             .audioChannels(1)
             .on('end', () => resolve())
@@ -43,7 +44,7 @@ const convertWavToPcm = (wavPath, pcmPath) => {
     });
 };
 
-// 1. API សម្រាប់ Upload និងរៀបចំឯកសារ (ទុកអោយ Frontend ចាក់ស្ដាប់ និងទាញយក)
+// 1. API សម្រាប់ Upload 
 app.post('/api/process-file', upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: "មិនមានឯកសារឡើយ" });
 
@@ -70,42 +71,40 @@ app.post('/api/process-file', upload.single('file'), (req, res) => {
         .save(audioPath);
 });
 
-// 2. API សម្រាប់ Transcript (កែសម្រួលឲ្យហុច Float32Array ទៅឲ្យ AI)
+// 2. API សម្រាប់ Transcript (ទម្រង់សន្សំសំចៃ RAM ខ្ពស់)
 app.post('/api/transcript', async (req, res) => {
     const { audioName, language } = req.body;
     if (!audioName) return res.status(400).json({ error: "មិនមានឈ្មោះ File Audio" });
 
     const audioPath = path.join('uploads', audioName);
-    const pcmPath = audioPath + '.pcm'; // បង្កើត File បណ្ដោះអាសន្ន
+    const pcmPath = audioPath + '.pcm';
 
     if (!fs.existsSync(audioPath)) {
         return res.status(404).json({ error: "រកមិនឃើញឯកសារសំឡេង" });
     }
 
     try {
-        // ជំហានទី ១៖ ប្រើ ffmpeg ទាញយកទិន្នន័យលេខរាយពីហ្វាយ WAV
         await convertWavToPcm(audioPath, pcmPath);
 
-        // ជំហានទី ២៖ អានឯកសារលេខរាយនោះ រួចបម្លែងវាទៅជា Float32Array ត្រឹមត្រូវតាមច្បាប់ Node.js
+        // វិធីសាស្ត្រថ្មី៖ អានទិន្នន័យផ្ទាល់ពី Memory Buffer ដោយមិនបង្កើតទិន្នន័យស្ទួន (Zero-Copy)
         const buffer = fs.readFileSync(pcmPath);
-        const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length);
-        const audioData = new Float32Array(arrayBuffer);
-        
-        // ជំហានទី ៣៖ លុបហ្វាយបណ្ដោះអាសន្ន (.pcm) ចោលដើម្បីកុំឲ្យធ្ងន់ម៉ាស៊ីន
-        if (fs.existsSync(pcmPath)) fs.unlinkSync(pcmPath);
+        const audioData = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.length / 4);
 
-        // ជំហានទី ៤៖ បញ្ជូនគំនរទិន្នន័យលេខ (audioData) ទៅឲ្យ AI ដំណើរការ
         const model = await getTranscriber();
         const options = { task: 'transcribe' };
         if (language && language !== 'auto') {
             options.language = language;
         }
 
-        const result = await model(audioData, options); // លែងហុចផ្លូវហ្វាយ គឺហុចទិន្នន័យលេខចំៗ
+        const result = await model(audioData, options);
+
+        // សម្អាតទិន្នន័យក្នុង RAM ភ្លាមៗក្រោយប្រើរួច
+        if (fs.existsSync(pcmPath)) fs.unlinkSync(pcmPath);
+
         res.json({ text: result.text });
 
     } catch (error) {
-        if (fs.existsSync(pcmPath)) fs.unlinkSync(pcmPath); // ការពារករណី Error តែមិនទាន់បានលុបហ្វាយ
+        if (fs.existsSync(pcmPath)) fs.unlinkSync(pcmPath);
         console.error(error);
         res.status(500).json({ error: "AI មានបញ្ហាក្នុងការស្ដាប់៖ " + error.message });
     }
