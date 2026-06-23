@@ -79,18 +79,19 @@ app.post('/api/transcript', async (req, res) => {
 
         console.log("កំពុងផ្ញើសំណើទៅកាន់ Hugging Face AI...");
         
-        // 🚀 ហៅទៅកាន់ Hugging Face API ដោយប្រើប្រាស់ METHOD: POST និង HEADERS
-        const hfResponse = await fetch(
-            "https://api-inference.huggingface.co/models/openai/whisper-large-v3",
-            {
-                method: "POST", // ប្រើប្រាស់ POST Method
-                headers: { 
-                    "Authorization": `Bearer ${HF_TOKEN}`, // ដាក់ Token ក្នុង Headers
-                    "Content-Type": "audio/wav"
-                },
-                body: audioBuffer,
-            }
-        );
+        // 🚀 ប្ដូរលីងទៅជា distil-large-v3 វិញ (រត់លឿនដូចរន្ទះ មិនងាយជាប់ Timeout)
+const hfResponse = await fetch(
+    "https://api-inference.huggingface.co/models/distil-whisper/distil-large-v3",
+    {
+        method: "POST",
+        headers: { 
+            "Authorization": `Bearer ${HF_TOKEN}`,
+            "Content-Type": "audio/wav"
+        },
+        body: audioBuffer,
+    }
+);
+
 
         const result = await hfResponse.json();
 
