@@ -2,7 +2,6 @@
 // server.js — Audio Transcription App (Render Free Tier Safe)
 // Model: distil-whisper/distil-large-v3 via HF Inference API
 // Author: Production-ready · No C++ bindings · 512MB RAM safe
-// Fix v2: AbortController timeout + https keepAlive agent
 // ============================================================
 
 'use strict';
@@ -14,15 +13,6 @@ const multer   = require('multer');
 const cors     = require('cors');
 const fs       = require('fs');
 const path     = require('path');
-const https    = require('https');
-
-// ── Keep-alive HTTPS agent (prevents "fetch failed" on Render) ─
-// Render free tier closes idle connections — keepAlive prevents this
-const keepAliveAgent = new https.Agent({ keepAlive: true });
-
-// ── Timeout constants ────────────────────────────────────────
-// HF cold-start + transcription can take up to 2 min for large files
-const HF_TIMEOUT_MS = 120_000; // 120 seconds
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -108,10 +98,6 @@ app.post('/api/transcript', upload.single('audio'), async (req, res) => {
   safeDelete(tempPath);
 
   // ── Call Hugging Face Inference API ─────────────────────────
-  // AbortController gives us a hard timeout so Render never hangs forever
-  const controller = new AbortController();
-  const timeoutId  = setTimeout(() => controller.abort(), HF_TIMEOUT_MS);
-
   let hfResponse;
   try {
     hfResponse = await fetch(HF_API_URL, {
@@ -121,24 +107,15 @@ app.post('/api/transcript', upload.single('audio'), async (req, res) => {
         'Content-Type'     : req.file.mimetype || 'application/octet-stream',
         'X-Wait-For-Model' : 'true',   // Wait for cold-start model load instead of erroring
       },
-      body   : audioBuffer,
-      signal : controller.signal,      // ← hard timeout after 120s
-      agent  : keepAliveAgent,         // ← prevents Render idle-connection drops
+      body: audioBuffer,
+      // Node 18 native fetch doesn't support a timeout option directly,
+      // so we rely on HF's own timeout + X-Wait-For-Model
     });
   } catch (networkErr) {
-    // AbortError = our own timeout fired
-    if (networkErr.name === 'AbortError') {
-      console.error('[hf-fetch] Request timed out after', HF_TIMEOUT_MS / 1000, 's');
-      return res.status(504).json({
-        error: `ការប្ដូរ Timeout បន្ទាប់ពី ${HF_TIMEOUT_MS / 1000} វិនាទី។ ឯកសារអូឌីយ៉ូអាចធំពេក ឬ HF API យឺត។ សូមសាកលក្បិនជាមួយឯកសារតូចជាង 5MB ហើយព្យាយាមម្ដងទៀត។`,
-      });
-    }
     console.error('[hf-fetch] Network error:', networkErr.message);
     return res.status(502).json({
-      error: `មិនអាចភ្ជាប់ទៅ Hugging Face API: ${networkErr.message}. សូមព្យាយាមម្ដងទៀតក្នុងរយៈ 30 វិនាទី។`,
+      error: `មិនអាចភ្ជាប់ទៅ Hugging Face API: ${networkErr.message}. សូមពិនិត្យការតភ្ជាប់អ៊ីន្ធឺណេត ហើយព្យាយាមម្ដងទៀត។`,
     });
-  } finally {
-    clearTimeout(timeoutId); // always clear the timer to prevent memory leak
   }
 
   // ── Parse HF response ────────────────────────────────────────
@@ -222,13 +199,8 @@ app.use((err, _req, res, _next) => {
 app.get('/health', (_req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
 
 // ── Start server ─────────────────────────────────────────────
-const server = app.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log(`✅ Audio Transcription Server started on port ${PORT}`);
-  console.log(`   Model    : distil-whisper/distil-large-v3`);
-  console.log(`   Timeout  : ${HF_TIMEOUT_MS / 1000}s per HF request`);
-  console.log(`   HF_TOKEN : ${process.env.HF_TOKEN ? '✓ set' : '✗ MISSING — set in .env or Render env vars'}`);
+  console.log(`   Model  : distil-whisper/distil-large-v3`);
+  console.log(`   HF_TOKEN: ${process.env.HF_TOKEN ? '✓ set' : '✗ MISSING — set in .env or Render env vars'}`);
 });
-
-// Raise Node's own HTTP server timeout above our fetch timeout
-// so the response pipe never closes before we finish
-server.setTimeout(HF_TIMEOUT_MS + 10_000); // 130s
